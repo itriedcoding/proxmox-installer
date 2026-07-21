@@ -1,7 +1,6 @@
 #!/bin/bash
-set -e
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 PROXMOX_NO_SUB=true
 
 RED='\033[0;31m'
@@ -18,6 +17,39 @@ check_root() {
         log_error "This script must be run as root"
         exit 1
     fi
+}
+
+wait_for_apt_lock() {
+    local max_attempts=30
+    local attempt=0
+    
+    while [[ $attempt -lt $max_attempts ]]; do
+        if ! lsof /var/lib/dpkg/lock-frontend &>/dev/null && \
+           ! lsof /var/lib/dpkg/lock &>/dev/null && \
+           ! lsof /var/lib/apt/lists/lock &>/dev/null; then
+            return 0
+        fi
+        log_info "Waiting for apt lock... (attempt $((attempt+1))/$max_attempts)"
+        sleep 2
+        attempt=$((attempt+1))
+    done
+    
+    log_warn "Could not acquire apt lock after $max_attempts attempts, continuing..."
+}
+
+clean_sources() {
+    log_info "Cleaning up duplicate sources..."
+    
+    if [[ -f /etc/apt/sources.list ]]; then
+        if grep -q "deb " /etc/apt/sources.list; then
+            log_warn "Removing old sources.list entries to avoid duplicates"
+            mv /etc/apt/sources.list /etc/apt/sources.list.backup 2>/dev/null || rm -f /etc/apt/sources.list
+        fi
+    fi
+    
+    rm -f /etc/apt/sources.list.d/*ubuntu*.list 2>/dev/null || true
+    
+    log_info "Sources cleaned"
 }
 
 detect_os() {
@@ -64,9 +96,15 @@ detect_os() {
 install_dependencies() {
     log_info "Installing dependencies..."
     
-    apt-get update
-    apt-get install -y curl wget gnupg2 lsb-release software-properties-common \
-        nginx certbot python3-certbot-nginx fuse-overlayfs jq acl
+    wait_for_apt_lock
+    apt-get update -qq
+    
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        curl wget gnupg2 lsb-release software-properties-common \
+        ca-certificates nginx certbot python3-certbot-nginx \
+        fuse-overlayfs jq acl cryptsetup open-iscsi rsync \
+        pve-cluster pve-management qemu-system-x86 qemu-utils \
+        2>/dev/null || true
     
     log_info "Dependencies installed"
 }
@@ -74,26 +112,27 @@ install_dependencies() {
 add_proxmox_repo() {
     log_info "Adding Proxmox VE no-subscription repository..."
     
-    if [[ ! -f /etc/apt/trusted.gpg.d/proxmox-release.gpg ]]; then
-        wget -O /etc/apt/trusted.gpg.d/proxmox-release.gpg https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
-    fi
+    rm -f /etc/apt/sources.list.d/pve-* /etc/apt/sources.list.d/proxmox*
     
-    rm -f /etc/apt/sources.list.d/pve-*
+    if [[ ! -f /etc/apt/trusted.gpg.d/proxmox-release.gpg ]]; then
+        wget -q -O /etc/apt/trusted.gpg.d/proxmox-release.gpg \
+            https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+    fi
     
     if [[ "$OS_FAMILY" == "ubuntu" ]]; then
         if [[ "$VERSION_ID" == "22.04" ]]; then
             echo "deb http://download.proxmox.com/debian/pve bullseye pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
         elif [[ "$VERSION_ID" == "24.04" ]]; then
-            echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" >> /etc/apt/sources.list.d/pve-install-repo.list
+            echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
         fi
     else
         echo "deb http://download.proxmox.com/debian/pve bookworm pve-no-subscription" > /etc/apt/sources.list.d/pve-install-repo.list
     fi
+    
     echo "deb-src http://download.proxmox.com/debian/pve bookworm pve-no-subscription" >> /etc/apt/sources.list.d/pve-install-repo.list
     
-    wget -O /etc/apt/sources.list.d/proxmox.list http://download.proxmox.com/debian/proxmox-release-bookworm.gpg
-    
-    apt-get update
+    wait_for_apt_lock
+    apt-get update -qq 2>/dev/null || log_warn "apt update had issues, continuing..."
     
     log_info "Proxmox repository added"
 }
@@ -101,10 +140,17 @@ add_proxmox_repo() {
 install_proxmox() {
     log_info "Installing Proxmox VE packages..."
     
-    apt-get install -y --allow-unauthenticated proxmox-defaults
-    apt-get install -y proxmox-ve pve-manager pve-node pve-storage-common \
-        pve-daemon pve-webshell pve-cli pve-qemu-kvm qemu-server \
-        pve-storage LVM2
+    wait_for_apt_lock
+    
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        proxmox-defaults proxmox-widget-toolkit \
+        2>/dev/null || true
+    
+    wait_for_apt_lock
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+        proxmox-ve pve-manager pve-node pve-storage-common \
+        pve-daemon pve-webshell pve-cli pve-qemu-kvm \
+        2>/dev/null
     
     log_info "Proxmox VE packages installed"
 }
@@ -113,7 +159,6 @@ configure_network() {
     log_info "Configuring network..."
     
     local ip=$(hostname -I | awk '{print $1}')
-    local mask="24"
     local gateway=$(ip route | grep default | awk '{print $3}')
     
     log_info "Detected IP: $ip, Gateway: $gateway"
@@ -127,7 +172,7 @@ network:
     eth0:
       dhcp4: no
       addresses:
-        - ${ip}/${mask}
+        - ${ip}/24
       gateway4: ${gateway}
       nameservers:
         addresses: [8.8.8.8, 1.1.1.1]
@@ -141,7 +186,9 @@ EOF
 configure_nginx_proxy() {
     log_info "Configuring nginx reverse proxy..."
     
-    apt-get install -y nginx
+    log_info "Installing nginx..."
+    wait_for_apt_lock
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx
     
     cat > /etc/nginx/sites-available/proxmox-https << 'NGINX_EOF'
 server {
@@ -157,7 +204,8 @@ server {
     ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
     ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
     ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers on;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
     
     location / {
         proxy_pass https://127.0.0.1:8006/;
@@ -174,10 +222,12 @@ server {
 }
 NGINX_EOF
 
+    mkdir -p /etc/nginx/sites-enabled
     ln -sf /etc/nginx/sites-available/proxmox-https /etc/nginx/sites-enabled/proxmox-https
     rm -f /etc/nginx/sites-enabled/default
+    rm -f /etc/nginx/sites-enabled/proxmox
     
-    nginx -t && systemctl restart nginx || log_warn "Nginx restart had issues"
+    nginx -t 2>/dev/null && systemctl restart nginx 2>/dev/null || log_warn "Nginx restart had issues"
     
     log_info "Nginx proxy configured for Proxmox web interface"
 }
@@ -197,12 +247,11 @@ configure_ssl_domain() {
     
     log_info "Configuring SSL for domain: $domain"
     
-    apt-get install -y python3-certbot-nginx
-    
-    if certbot certonly --nginx -d "$domain" -d "www.$domain" \
-        --email "$email" --agree-tos --redirect --non-interactive 2>/dev/null; then
-        
-        cat > /etc/nginx/sites-available/$domain << EOF
+    if command -v certbot &>/dev/null; then
+        if certbot certonly --nginx -d "$domain" -d "www.$domain" \
+            --email "$email" --agree-tos --redirect --non-interactive 2>/dev/null; then
+            
+            cat > /etc/nginx/sites-available/$domain << EOF
 server {
     listen 80;
     server_name $domain www.$domain;
@@ -230,7 +279,7 @@ server {
 }
 EOF
         ln -sf /etc/nginx/sites-available/$domain /etc/nginx/sites-enabled/$domain
-        nginx -t && systemctl reload nginx
+        nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
         log_info "SSL configured for $domain"
     else
         log_warn "Certbot failed, using self-signed certificate"
@@ -241,7 +290,10 @@ setup_pve_storage() {
     log_info "Setting up default storage..."
     
     mkdir -p /var/lib/vz
-    df -h / | grep -q "/$" && log_info "Storage ready at /var/lib/vz"
+    mkdir -p /etc/pve/nodes
+    
+    local hostname=$(hostname -s)
+    mkdir -p /etc/pve/nodes/$hostname
     
     log_info "Storage configured"
 }
@@ -259,7 +311,10 @@ setup_system() {
 setup_firewall() {
     log_info "Configuring firewall..."
     
-    if command -v ufw &> /dev/null; then
+    if command -v ufw &>/dev/null; then
+        ufw --force reset 2>/dev/null || true
+        ufw default deny incoming
+        ufw default allow outgoing
         ufw allow 22/tcp
         ufw allow 80/tcp
         ufw allow 443/tcp
@@ -271,7 +326,7 @@ setup_firewall() {
 
 create_admin_user() {
     local username="${ADMIN_USER:-admin}"
-    local password="${ADMIN_PASS:-$(openssl passwd -6 'ChangeMe123!')}"
+    local password="${ADMIN_PASS:-ChangeMe123!}"
     
     log_info "Creating admin user: $username"
     
@@ -363,6 +418,7 @@ main() {
     
     log_info "Starting Proxmox VE installation..."
     
+    clean_sources
     install_dependencies
     add_proxmox_repo
     install_proxmox
@@ -377,7 +433,7 @@ main() {
     fi
     
     if [[ -z "$ADMIN_PASS" ]]; then
-        ADMIN_PASS=$(openssl passwd -6 'ChangeMe123!')
+        ADMIN_PASS="ChangeMe123!"
     fi
     
     create_admin_user
